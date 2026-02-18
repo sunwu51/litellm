@@ -328,20 +328,34 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
     ) -> bool:
         if stream is not True:
             return False
-        if model is not None:
-            try:
-                if (
-                    litellm.utils.supports_native_streaming(
-                        model=model,
-                        custom_llm_provider=custom_llm_provider,
-                    )
-                    is False
-                ):
-                    return True
-            except Exception as e:
-                verbose_logger.debug(
-                    f"Error getting model info in OpenAIResponsesAPIConfig: {e}"
-                )
+        if model is None:
+            return False
+
+        model_for_check = model
+        try:
+            model_for_check, _, _, _ = litellm.get_llm_provider(
+                model=model,
+                custom_llm_provider=custom_llm_provider,
+            )
+        except Exception:
+            pass
+
+        if isinstance(model_for_check, str) and model_for_check.startswith("responses/"):
+            model_for_check = model_for_check[len("responses/") :]
+
+        try:
+            model_info = litellm.get_model_info(
+                model=model_for_check,
+                custom_llm_provider=custom_llm_provider,
+            )
+        except Exception:
+            # Unknown OpenAI-compatible models are common. Prefer native streaming
+            # instead of forcing fake_stream, which removes "stream" from payload.
+            return False
+
+        supports_native_streaming = model_info.get("supports_native_streaming", True)
+        if supports_native_streaming is False:
+            return True
         return False
 
     #########################################################

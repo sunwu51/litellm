@@ -147,8 +147,8 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
             tool_calls = msg.get("tool_calls")
             tool_call_id = msg.get("tool_call_id")
 
-            if role == "system":
-                # Extract system message as instructions
+            if role == "system" or role == "developer":
+                # Extract system/developer message as instructions
                 if isinstance(content, str):
                     if instructions:
                         # Concatenate multiple system prompts with a space
@@ -159,7 +159,7 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
                     input_items.append(
                         {
                             "type": "message",
-                            "role": role,
+                            "role": "developer",
                             "content": self._convert_content_to_responses_format(
                                 content,
                                 role,  # type: ignore
@@ -288,12 +288,10 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
                 request_data["instructions"] = instructions
             elif key == "stream_options" and isinstance(value, dict):
                 request_data["stream_options"] = value.get("include_obfuscation")
-            elif key == "user" and isinstance(value, str):
-                # OpenAI API requires user param to be max 64 chars - truncate if longer
-                if len(value) <= 64:
-                    request_data["user"] = value
-                else:
-                    request_data["user"] = value[:64]
+            elif key == "user":
+                # Some downstream Responses providers reject/ignore top-level user.
+                # Drop it in chat->responses bridge requests for compatibility.
+                continue
             else:
                 request_data[key] = value
 
@@ -541,7 +539,12 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
         return OpenAiResponsesToChatCompletionStreamIterator(streaming_response, sync_stream, json_mode)
 
     def _convert_content_str_to_input_text(self, content: str, role: str) -> Dict[str, Any]:
-        if role == "user" or role == "system" or role == "tool":
+        if (
+            role == "user"
+            or role == "system"
+            or role == "developer"
+            or role == "tool"
+        ):
             return {"type": "input_text", "text": content}
         else:
             return {"type": "output_text", "text": content}
@@ -654,13 +657,51 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
     def _convert_tools_to_responses_format(self, tools: List[Dict[str, Any]]) -> List["ALL_RESPONSES_API_TOOL_PARAMS"]:
         """Convert chat completion tools to responses API tools format"""
         responses_tools: List["ALL_RESPONSES_API_TOOL_PARAMS"] = []
+        web_search_tool_added = False
         for tool in tools:
             # convert function tool from chat completion to responses API format
             if tool.get("type") == "function":
-                function_tool = cast(ChatCompletionToolParamFunctionChunk, tool.get("function"))
+                # Support both:
+                # 1) OpenAI-style {"type":"function","function":{"name":...}}
+                # 2) Claude-style {"type":"function","name":...,"parameters":...}
+                raw_function_tool = tool.get("function")
+                function_tool: Dict[str, Any]
+                if isinstance(raw_function_tool, dict):
+                    function_tool = cast(
+                        ChatCompletionToolParamFunctionChunk, raw_function_tool
+                    )
+                else:
+                    function_tool = {
+                        "name": tool.get("name"),
+                        "parameters": tool.get("parameters"),
+                        "strict": tool.get("strict"),
+                        "description": tool.get("description"),
+                    }
+
+                function_name = function_tool.get("name")
+                if function_name in ("web_search", "web_fetch"):
+                    # ClaudeCode built-in web tools arrive as "function" tools.
+                    # Downstream Responses providers expect native web_search tool.
+                    if not web_search_tool_added:
+                        responses_tools.append(
+                            cast(
+                                Any,
+                                {
+                                    "type": "web_search",
+                                    "search_context_size": "medium",
+                                },
+                            )
+                        )
+                        web_search_tool_added = True
+                    continue
+
+                if not function_name:
+                    responses_tools.append(tool)  # type: ignore
+                    continue
+
                 responses_tools.append(
                     FunctionToolParam(
-                        name=function_tool["name"],
+                        name=function_name,
                         parameters=function_tool.get("parameters"),
                         strict=function_tool.get("strict"),
                         type="function",
